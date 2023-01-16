@@ -1,3 +1,4 @@
+use std::str;
 use std::fs;
 use std::fs::File;
 use num::bigint::Sign;
@@ -6,16 +7,16 @@ use bytes::Bytes;
 use std::env;
 use std::process;
 use std::io::Read;
-//use std::io::Write;
 use std::io::Seek;
 use std::io::SeekFrom;
 use std::io::Cursor;
 use hex;
 use sha2::Sha256;
+use sha2::Digest;
 use hmac::{Hmac, Mac};
 use libaes::Cipher;
-//use std::io::Bytes;
 
+type HmacSha256 = Hmac<Sha256>;
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() != 2 {
@@ -28,45 +29,76 @@ fn main() {
 }
 
 fn dump(fware: String) {
+    let UPDATE_FILE = 2;
+    let UNLINK_FILE = 3;
+    let SYMLINK_FILE = 4;
+    let REMOVE_DIRECTORY = 5;
+    let EXECUTE_PAYLOAD = 6;
     println!("Hello from dump");
-    //let payload = Vec::new();
     let (version, payload) = decrypt(fware);//, payload);
     println!("{} {}", version, payload.len());
     let mut product_buf = [0u8; 4];
     let mut cursor = Cursor::new(payload);
-    let product = cursor.read(&mut product_buf).unwrap() as u32;
-    assert!(product == 0x010000a5,"{} != {}", 0x010000a5, product);
-    /*
-    product, version_again, num_operations, header_size = struct.unpack("<IIII", cursor.read(16))
-    assert product == 0x010000a5
-    assert version_again == version
-    cursor.seek(header_size)
-
-    print(f"Firmware update has {num_operations} operations:")
-
-    for i in range(num_operations):
-        op_size, raw_op_type, op_arg, op_path_size, op_extra_size = struct.unpack("<IIIII", cursor.read(20))
-        op_type = OperationType(raw_op_type)
-        op_path = cursor.read(op_path_size).decode("utf-8")[:-1]
-
-        alignment_remainder = op_path_size % 4
-        if alignment_remainder != 0:
-            alignment_padding = 4 - alignment_remainder
-            cursor.seek(alignment_padding, os.SEEK_CUR)
-        else:
-            alignment_padding = 0
-
-        op_data = cursor.read(op_size - (20 + op_path_size + alignment_padding + op_extra_size))
-
-        print(f"\t{op_type} arg={op_arg} path=\"{op_path}\"")
-
-        if op_type is OperationType.UPDATE_FILE:
-            h = hashes.Hash(hashes.SHA256())
-            h.update(op_data)
-            digest = h.finalize().hex()
-            print(f"\t\tdata=({len(op_data)} bytes, SHA-256: {digest})")
-
-            if output_dir is not None:
+    cursor.read(&mut product_buf).unwrap();
+    let product = u32::from_le_bytes(product_buf);
+    assert!(product == 0x010000a5,"fixed: {} != calculated {}", 0x010000a5, product);
+    let mut v_buf = [0u8; 4];
+    cursor.read(&mut v_buf).unwrap();
+    let version_again = u32::from_le_bytes(v_buf);
+    assert!(version == version_again, "Header Version: {} != Payload Version: {}", version, version_again);
+    let mut ops_buf = [0u8; 4];
+    cursor.read(&mut ops_buf).unwrap();
+    let num_ops = u32::from_le_bytes(ops_buf);
+    let mut hdr_buf = [0u8; 4];
+    cursor.read(&mut hdr_buf).unwrap();
+    let hdr_size = u32::from_le_bytes(hdr_buf);
+    cursor.seek(SeekFrom::Start(hdr_size as u64));
+    println!("Firmware update has {} operations", num_ops);
+    for i in 0..num_ops {
+        let mut op_sz_buf = [0u8; 4];
+        cursor.read(&mut op_sz_buf);
+        let op_size = u32::from_le_bytes(op_sz_buf);
+        let mut op_type_buf = [0u8; 4];
+        cursor.read(&mut op_type_buf);
+        let op_type = u32::from_le_bytes(op_type_buf);
+        let mut op_arg_buf = [0u8; 4];
+        cursor.read(&mut op_arg_buf);
+        let op_arg = u32::from_le_bytes(op_arg_buf);
+        let mut op_path_sz_buf = [0u8; 4];
+        cursor.read(&mut op_path_sz_buf);
+        let op_path_sz = u32::from_le_bytes(op_path_sz_buf);
+        let mut op_xtra_sz_buf = [0u8; 4];
+        cursor.read(&mut op_xtra_sz_buf);
+        let op_xtra_sz = u32::from_le_bytes(op_xtra_sz_buf);
+        let mut op_path_buf = vec![0u8; op_path_sz.try_into().unwrap()];
+        cursor.read(&mut op_path_buf);
+        let s = match str::from_utf8(&mut op_path_buf) {
+            Ok(v) => v,
+            Err(e) => "b00m",
+        };
+        let op_path = s;
+        let alignment_rem = op_path_sz % 4;
+        let mut alignment_padding = 0;
+        if alignment_rem != 0 {
+            alignment_padding = 4 - alignment_rem;
+            cursor.seek(SeekFrom::Current(alignment_padding as i64));
+        }
+        let op_data_sz = op_size - 20 - op_path_sz - alignment_padding - op_xtra_sz;
+        let mut op_data = vec![0u8; op_data_sz as usize];
+        cursor.read(&mut op_data);
+        println!("rep: {} op_sz:{} op_type:{} {} {} {}", i, op_size, op_type, op_arg, op_path_sz, op_xtra_sz);
+        let mut xtra_sz = vec![0u8; op_xtra_sz as usize];
+        cursor.read(&mut xtra_sz);
+        if op_type == UPDATE_FILE {
+            let mut hasher = Sha256::new();
+            let data_length = op_data.len();
+            hasher.update(op_data);
+            let digest = hasher.finalize();
+            println!("{} data={} bytes, SHA-256: {}", op_path, data_length, hex::encode(digest));
+        }
+    }
+    /*        
+    if output_dir is not None:
                 target_path = output_dir / op_path[1:]
                 target_path.parent.mkdir(parents=True, exist_ok=True)
                 target_path.write_bytes(op_data)
@@ -162,7 +194,6 @@ fn verify_signature(data: &[u8], encrypted_sig: &[u8], key: &[u8], e: BigInt, n:
                                                     0x00, 0x04, 0x20 ]);
 
     println!("Hello from verify");
-    type HmacSha256 = Hmac<Sha256>;
     let mut mac = HmacSha256::new_from_slice(key).expect("HMAC can take key of any size");
     mac.update(data);
     let digest = mac.finalize().into_bytes();
