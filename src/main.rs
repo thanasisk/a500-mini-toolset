@@ -1,12 +1,14 @@
 use std::str;
 use std::fs;
 use std::fs::File;
+use std::path::Path;
 use num::bigint::Sign;
 use num_bigint::BigInt;
 use bytes::Bytes;
 use std::env;
 use std::process;
 use std::io::Read;
+use std::io::Write;
 use std::io::Seek;
 use std::io::SeekFrom;
 use std::io::Cursor;
@@ -86,6 +88,7 @@ fn dump(fware: String) {
         let op_data_sz = op_size - 20 - op_path_sz - alignment_padding - op_xtra_sz;
         let mut op_data = vec![0u8; op_data_sz as usize];
         cursor.read(&mut op_data);
+        let mut file_data = op_data.clone();
         println!("rep: {} op_sz:{} op_type:{} {} {} {}", i, op_size, op_type, op_arg, op_path_sz, op_xtra_sz);
         let mut xtra_sz = vec![0u8; op_xtra_sz as usize];
         cursor.read(&mut xtra_sz);
@@ -95,9 +98,29 @@ fn dump(fware: String) {
             hasher.update(op_data);
             let digest = hasher.finalize();
             println!("{} data={} bytes, SHA-256: {}", op_path, data_length, hex::encode(digest));
+            let b: bool = Path::new("dumpdir").is_dir();
+            if b {
+                let root = Path::new("dumpdir");
+                assert!(env::set_current_dir(&root).is_ok());
+                let mut dump_path = env::current_dir().unwrap();
+                println!("The current directory is {}", dump_path.display());
+                let mut temp = op_path.split("/").collect::<Vec<_>>();
+                let mut fname = temp.pop().unwrap();
+                //let dirname = dump_path.push(temp.join("/"));
+                dump_path.push(Path::new(&temp.join("/")));
+                let dirname = dump_path.clone();
+                println!("{} {}", fname, dirname.as_path().display());
+                fs::create_dir_all(dump_dir.clone());
+                assert!(env::set_current_dir(dirname).is_ok());
+                println!("{:x?}",  fname.as_bytes()); // [61, 7a, 41, 5a, 0, 58, 30, 39]
+                let mut f = File::create(fname.trim_matches(char::from(0))).unwrap();
+                f.write(&mut file_data);
+                assert!(env::set_current_dir(dump_path).is_ok());
+            }
+
         }
     }
-    /*        
+    /*
     if output_dir is not None:
                 target_path = output_dir / op_path[1:]
                 target_path.parent.mkdir(parents=True, exist_ok=True)
