@@ -2,9 +2,11 @@ use std::str;
 use std::fs;
 use std::fs::File;
 use std::path::Path;
+use std::path::PathBuf;
 use num::bigint::Sign;
 use num_bigint::BigInt;
 use bytes::Bytes;
+use std::time::{Duration, Instant};
 use std::env;
 use std::process;
 use std::io::Read;
@@ -36,7 +38,6 @@ fn dump(fware: String) {
     let SYMLINK_FILE = 4;
     let REMOVE_DIRECTORY = 5;
     let EXECUTE_PAYLOAD = 6;
-    println!("Hello from dump");
     let (version, payload) = decrypt(fware);//, payload);
     println!("{} {}", version, payload.len());
     let mut product_buf = [0u8; 4];
@@ -95,42 +96,39 @@ fn dump(fware: String) {
         if op_type == UPDATE_FILE {
             let mut hasher = Sha256::new();
             let data_length = op_data.len();
+            let file_data = op_data.clone();
             hasher.update(op_data);
             let digest = hasher.finalize();
             println!("{} data={} bytes, SHA-256: {}", op_path, data_length, hex::encode(digest));
-            let b: bool = Path::new("dumpdir").is_dir();
+            let root = Path::new("dumpdir");
+            let b: bool = root.is_dir();
             if b {
-                let root = Path::new("dumpdir");
                 assert!(env::set_current_dir(&root).is_ok());
+                // we can also add a new var and remove mut ...
                 let mut dump_path = env::current_dir().unwrap();
-                println!("The current directory is {}", dump_path.display());
-                let mut temp = op_path.split("/").collect::<Vec<_>>();
-                let mut fname = temp.pop().unwrap();
-                //let dirname = dump_path.push(temp.join("/"));
-                dump_path.push(Path::new(&temp.join("/")));
-                let dirname = dump_path.clone();
-                println!("{} {}", fname, dirname.as_path().display());
-                fs::create_dir_all(dump_dir.clone());
-                assert!(env::set_current_dir(dirname).is_ok());
-                println!("{:x?}",  fname.as_bytes()); // [61, 7a, 41, 5a, 0, 58, 30, 39]
+                //println!("The current directory is {}", dump_path.display());
+                let mut base_path = PathBuf::from(dump_path.clone());
+                // PathBuf.push an absolute path overwrites the path ...
+                base_path.push(Path::new(&op_path[1..op_path.len()])); // push-ing an abs path overwrites ...
+                base_path.pop();
+                fs::create_dir_all(base_path.clone());
+                println!("{}", base_path.display());
+                let tmp = op_path.split("/").collect::<Vec<_>>();
+                let fname = tmp[tmp.len()-1];
+                println!("{}", fname);
+                assert!(env::set_current_dir(base_path).is_ok());
                 let mut f = File::create(fname.trim_matches(char::from(0))).unwrap();
-                f.write(&mut file_data);
-                assert!(env::set_current_dir(dump_path).is_ok());
+                f.write(&file_data);
+                // cd ..
+                dump_path.pop();
+                assert!(env::set_current_dir(dump_path.clone()).is_ok());
+                assert!(env::current_dir().unwrap() == dump_path,"{} != {}", env::current_dir().unwrap().display(), dump_path.display());
             }
-
         }
     }
-    /*
-    if output_dir is not None:
-                target_path = output_dir / op_path[1:]
-                target_path.parent.mkdir(parents=True, exist_ok=True)
-                target_path.write_bytes(op_data)
-                print("\t\twritten to:", target_path)
-
-        op_extra_data = cursor.read(op_extra_size)
-
-    assert len(cursor.read()) == 0
-*/
+    let mut junk = Vec::new();
+    let nbytes = cursor.read_to_end(&mut junk).unwrap();
+    assert!(nbytes == 0,"junk bytes found at end of file: {}", nbytes);
 }
 
 fn decrypt(fware: String) -> (u32, Vec<u8>) {
@@ -176,12 +174,10 @@ fn decrypt(fware: String) -> (u32, Vec<u8>) {
     let mut params_size = [0u8; 4];
     f.read(&mut params_size);
     println!("params_size: {}",u32::from_be_bytes(params_size));
-    //let mut encrypted_params = Vec::with_capacity(u32::from_be_bytes(params_size).try_into().unwrap());
     let mut encrypted_sz = vec![0; u32::from_be_bytes(params_size) as usize];
     println!("encrypted_sz.len() {}",encrypted_sz.len());
     f.read(&mut encrypted_sz);
     let encrypted_params = BigInt::from_bytes_be(Sign::Plus, &encrypted_sz);
-    println!("{}", encrypted_params);
     println!("Decrypting params");
     let raw_params_blob = encrypted_params.modpow(&pubkey_e, &pubkey_n).to_str_radix(16);
     let raw_params = hex::decode(&raw_params_blob[raw_params_blob.len() - ( 88 * 2) .. raw_params_blob.len()]).unwrap();
@@ -197,13 +193,15 @@ fn decrypt(fware: String) -> (u32, Vec<u8>) {
     f.read(&mut encrypted_payload);
     assert!(encrypted_payload.len() == enc_payload_sz,"actual {} != calculated {}", encrypted_payload.len(), enc_payload_sz);
     let mut raw_signature = Vec::new();
-    println!("{}",raw_signature.len()); // 0 - as it should be ...
     f.read_to_end(&mut raw_signature);
     assert!(raw_signature.len() == pubkey_n_raw.len(), "{}/{}/256 {}", raw_signature.len(), pubkey_n_raw.len(), fsize - encrypted_payload.len()as u64);
     println!("{} {}", encrypted_payload.len(), encrypted_payload.len() % 16);
-    println!("{} / 32", aes256_key.len());
+    assert!(32 == aes256_key.len(),"invalid length for AES256 key: {}", aes256_key.len());
     let cipher = Cipher::new_256(aes256_key.try_into().unwrap());
+    let before_dec = Instant::now();
     let payload = cipher.cbc_decrypt(aes256_iv.try_into().unwrap(), &encrypted_payload[..]).to_vec();
+    let after_dec = Instant::now();
+    println!("Decryption took {:?}", after_dec.duration_since(before_dec));
     // Yeehaw - cbc_decrypt takes care of padding automatically
     let signature  = num_bigint::BigInt::from_bytes_be(Sign::Plus, &raw_signature);
     verify_signature(&payload, &raw_signature, hmac_key, pubkey_e, pubkey_n);
@@ -216,14 +214,14 @@ fn verify_signature(data: &[u8], encrypted_sig: &[u8], key: &[u8], e: BigInt, n:
                                                     0x04, 0x02, 0x01, 0x05,
                                                     0x00, 0x04, 0x20 ]);
 
-    println!("Hello from verify");
+    let start = Instant::now();
     let mut mac = HmacSha256::new_from_slice(key).expect("HMAC can take key of any size");
     mac.update(data);
     let digest = mac.finalize().into_bytes();
     println!("{} {}", hex::encode(digest), digest.len()*8);
 
     let padding_needed = 256 - pkcs1_rsa_sha256_id.len() - 3 - digest.len();
-    println!("padding = {}", padding_needed);
+    //println!("padding = {}", padding_needed);
     let mut wrapped = Vec::new();
     wrapped.push(0x00 as u8);
     wrapped.push(0x01 as u8);
@@ -235,5 +233,7 @@ fn verify_signature(data: &[u8], encrypted_sig: &[u8], key: &[u8], e: BigInt, n:
     let expected_sig = num_bigint::BigInt::from_bytes_be(Sign::Plus, &wrapped);
     let actual_n = num_bigint::BigInt::from_bytes_be(Sign::Plus, &encrypted_sig);
     let actual_sig = actual_n.modpow(&e, &n);
+    let end = Instant::now();
+    println!("Signature verification took {:?}", end.duration_since(start));
     assert!(expected_sig == actual_sig,"expected/actual signature mismatch {} != {}", expected_sig, actual_sig);
 }
